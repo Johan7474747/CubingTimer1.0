@@ -1,0 +1,2071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Speedcubing Timer - csTimer Style</title>
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            app: 'var(--color-bg)',
+            panel: 'var(--color-panel)',
+            border: 'var(--color-border)',
+            text: 'var(--color-text)',
+            subtext: 'var(--color-subtext)',
+            accent: 'var(--color-accent)',
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Import Twisty Player Visualizer -->
+  <script src="https://cdn.cubing.net/v0/js/cubing/twisty" type="module"></script>
+
+  <!-- Firebase SDKs -->
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+
+  <script type="module">
+    const workerCode = `
+      import { randomScrambleForEvent } from "https://cdn.cubing.net/js/cubing/scramble";
+
+      const WCA_EVENT_MAP = {
+        "222": "222",
+        "333": "333",
+        "444": "444",
+        "pyram": "pyram",
+        "minx": "minx",
+        "clock": "clock"
+      };
+
+      function fallback333() {
+        const moves = ["R", "L", "U", "D", "F", "B"];
+        const modifiers = ["", "'", "2"];
+        let result = [];
+        let lastMove = "";
+        for (let i = 0; i < 20; i++) {
+          let move;
+          do { move = moves[Math.floor(Math.random() * moves.length)]; } while (move === lastMove);
+          lastMove = move;
+          result.push(move + modifiers[Math.floor(Math.random() * modifiers.length)]);
+        }
+        return result.join(" ");
+      }
+      function fallback222() {
+        const moves = ["R", "U", "F"];
+        const modifiers = ["", "'", "2"];
+        let result = [];
+        for (let i = 0; i < 9; i++) {
+          const move = moves[Math.floor(Math.random() * moves.length)];
+          result.push(move + modifiers[Math.floor(Math.random() * modifiers.length)]);
+        }
+        return result.join(" ");
+      }
+      function fallback444() {
+        const moves = ["R", "L", "U", "D", "F", "B", "Rw", "Lw", "Uw", "Dw", "Fw", "Bw"];
+        const modifiers = ["", "'", "2"];
+        let result = [];
+        let lastMove = "";
+        for (let i = 0; i < 40; i++) {
+          let move;
+          do { move = moves[Math.floor(Math.random() * moves.length)]; } while (move === lastMove);
+          lastMove = move;
+          result.push(move + modifiers[Math.floor(Math.random() * modifiers.length)]);
+        }
+        return result.join(" ");
+      }
+      function fallbackPyraminx() {
+        const moves = ["U", "L", "R", "B", "u", "l", "r", "b"];
+        const modifiers = ["", "'"];
+        let result = [];
+        for (let i = 0; i < 11; i++) {
+          const move = moves[Math.floor(Math.random() * moves.length)];
+          result.push(move + modifiers[Math.floor(Math.random() * modifiers.length)]);
+        }
+        return result.join(" ");
+      }
+      function fallbackMegaminx() {
+        const dirs = ["R++", "R--", "D++", "D--"];
+        let result = [];
+        for (let i = 0; i < 70; i++) {
+          result.push(dirs[Math.floor(Math.random() * dirs.length)]);
+        }
+        result.push("U");
+        return result.join(" ");
+      }
+      function fallbackClock() {
+        const pins = ["UR", "DR", "DL", "UL", "U", "R", "D", "L", "ALL"];
+        let result = [];
+        for (const p of pins) {
+          const val = Math.floor(Math.random() * 12) - 5;
+          result.push(p + (val >= 0 ? "+" + val : val));
+        }
+        return result.join(" ");
+      }
+
+      function generateFallbackScramble(event) {
+        switch (event) {
+          case "222": return fallback222();
+          case "444": return fallback444();
+          case "pyram": return fallbackPyraminx();
+          case "minx": return fallbackMegaminx();
+          case "clock": return fallbackClock();
+          default: return fallback333();
+        }
+      }
+
+      self.onmessage = async (e) => {
+        const { id, event } = e.data;
+        try {
+          const wcaEvent = WCA_EVENT_MAP[event] || "333";
+          const scramble = await randomScrambleForEvent(wcaEvent);
+          self.postMessage({ id, scramble: scramble.toString(), event });
+        } catch (err) {
+          self.postMessage({ id, scramble: generateFallbackScramble(event), event, usedFallback: true });
+        }
+      };
+    `;
+
+    const blob = new Blob([workerCode], { type: "application/javascript" });
+    const scrambleWorker = new Worker(URL.createObjectURL(blob), { type: "module" });
+
+    let currentScrambleText = "";
+    let currentEvent = "333";
+
+    const scrambleQueue = [];
+    const pendingRequests = new Map();
+    let requestCounter = 0;
+    let queueFillInFlight = false;
+
+    scrambleWorker.onmessage = (e) => {
+      const { id, scramble, event } = e.data;
+      if (pendingRequests.has(id)) {
+        const resolve = pendingRequests.get(id);
+        pendingRequests.delete(id);
+        resolve({ scramble, event });
+      }
+    };
+
+    function requestScrambleFromWorker(event) {
+      return new Promise((resolve) => {
+        const id = ++requestCounter;
+        pendingRequests.set(id, resolve);
+        scrambleWorker.postMessage({ id, event });
+      });
+    }
+
+    async function replenishQueue(event = currentEvent) {
+      if (queueFillInFlight) return;
+      if (scrambleQueue.length >= 2) return;
+      queueFillInFlight = true;
+      try {
+        const result = await requestScrambleFromWorker(event);
+        if (result.event === currentEvent) {
+          scrambleQueue.push(result.scramble);
+        }
+      } finally {
+        queueFillInFlight = false;
+      }
+    }
+
+    async function fetchScramble(event = currentEvent) {
+      if (scrambleQueue.length > 0) {
+        const scramble = scrambleQueue.shift();
+        replenishQueue(event);
+        return scramble;
+      }
+      const result = await requestScrambleFromWorker(event);
+      replenishQueue(event);
+      return result.scramble;
+    }
+
+    const PUZZLE_CONFIG = {
+      "222": { puzzle: "2x2x2", visualization: "2D" },
+      "333": { puzzle: "3x3x3", visualization: "2D" },
+      "444": { puzzle: "4x4x4", visualization: "2D" },
+      "pyram": { puzzle: "pyraminx", visualization: "2D" },
+      "minx": { puzzle: "megaminx", visualization: "3D" },
+      "clock": { puzzle: "clock", visualization: "2D" }
+    };
+
+    async function updateScramble(customScramble = null, eventChanged = false, targetEvent = null) {
+      const scrambleEl = document.getElementById("scramble");
+      const visualizerEl = document.getElementById("visualizer");
+      if (!scrambleEl) return;
+
+      const activeEvent = targetEvent || currentEvent;
+
+      if (eventChanged) {
+        scrambleQueue.length = 0;
+        currentScrambleText = "";
+      }
+
+      if (customScramble) {
+        currentScrambleText = customScramble;
+      } else {
+        if (!currentScrambleText && scrambleQueue.length === 0) {
+          scrambleEl.textContent = "Generating scramble...";
+        }
+        currentScrambleText = await fetchScramble(activeEvent);
+      }
+
+      scrambleEl.textContent = currentScrambleText;
+
+      if (visualizerEl) {
+        const config = PUZZLE_CONFIG[activeEvent] || PUZZLE_CONFIG["333"];
+        visualizerEl.setAttribute("puzzle", config.puzzle);
+        visualizerEl.setAttribute("event", activeEvent);
+        visualizerEl.setAttribute("visualization", config.visualization);
+        visualizerEl.setAttribute("alg", currentScrambleText);
+      }
+    }
+
+    async function setEvent(newEvent) {
+      currentEvent = newEvent;
+      await updateScramble(null, true);
+    }
+
+    async function renderThumbnail(scramble, event, container) {
+      container.innerHTML = "";
+      const config = PUZZLE_CONFIG[event] || PUZZLE_CONFIG["333"];
+      const el = document.createElement("twisty-player");
+      el.setAttribute("puzzle", config.puzzle);
+      el.setAttribute("visualization", config.visualization);
+      el.setAttribute("alg", scramble);
+      el.setAttribute("hint-facelets", "none");
+      el.setAttribute("control-panel", "none");
+      el.setAttribute("background", "none");
+      el.style.width = "100%";
+      el.style.height = "100%";
+      container.appendChild(el);
+    }
+
+    window.updateScramble = updateScramble;
+    window.setEvent = setEvent;
+    window.getCurrentScramble = () => currentScrambleText;
+    window.getCurrentEvent = () => currentEvent;
+    window.renderThumbnail = renderThumbnail;
+  </script>
+
+  <style>
+    :root {
+      --color-bg: #0f172a;
+      --color-panel: #1e293b;
+      --color-border: #334155;
+      --color-text: #f8fafc;
+      --color-subtext: #94a3b8;
+      --color-accent: #3b82f6;
+      --color-scrollbar-track: rgba(0, 0, 0, 0.2);
+      --color-scrollbar-thumb: #334155;
+      --color-scrollbar-hover: #475569;
+      --color-input-bg: #111827;
+      --color-btn-bg: #374151;
+      --color-btn-hover: #4b5563;
+      --color-hover-border: rgba(59, 130, 246, 0.5);
+
+      --stat-best-text: #38bdf8;
+      --stat-best-border: rgba(56, 189, 248, 0.25);
+      --stat-ao5-text: #4ade80;
+      --stat-ao5-border: rgba(74, 222, 128, 0.25);
+      --stat-ao12-text: #c084fc;
+      --stat-ao12-border: rgba(192, 132, 252, 0.25);
+      --stat-mean3-text: #fb923c;
+      --stat-mean3-border: rgba(251, 146, 60, 0.25);
+      --stat-stddev-text: #f472b6;
+      --stat-stddev-border: rgba(244, 114, 182, 0.25);
+    }
+
+    [data-theme="oled"] {
+      --color-bg: #000000;
+      --color-panel: #0a0a0a;
+      --color-border: #1f1f1f;
+      --color-text: #ffffff;
+      --color-subtext: #888888;
+      --color-accent: #22c55e;
+      --color-scrollbar-track: #000000;
+      --color-scrollbar-thumb: #222222;
+      --color-scrollbar-hover: #333333;
+      --color-input-bg: #000000;
+      --color-btn-bg: #18181b;
+      --color-btn-hover: #27272a;
+      --color-hover-border: #22c55e;
+
+      --stat-best-text: #00f0ff;
+      --stat-best-border: rgba(0, 240, 255, 0.3);
+      --stat-ao5-text: #00ff66;
+      --stat-ao5-border: rgba(0, 255, 102, 0.3);
+      --stat-ao12-text: #b026ff;
+      --stat-ao12-border: rgba(176, 38, 255, 0.3);
+      --stat-mean3-text: #ffae00;
+      --stat-mean3-border: rgba(255, 174, 0, 0.3);
+      --stat-stddev-text: #ff4d94;
+      --stat-stddev-border: rgba(255, 77, 148, 0.3);
+    }
+
+    [data-theme="solarized"] {
+      --color-bg: #002b36;
+      --color-panel: #073642;
+      --color-border: #586e75;
+      --color-text: #fdf6e3;
+      --color-subtext: #839496;
+      --color-accent: #b58900;
+      --color-scrollbar-track: #00212b;
+      --color-scrollbar-thumb: #586e75;
+      --color-scrollbar-hover: #657b83;
+      --color-input-bg: #00212b;
+      --color-btn-bg: #073642;
+      --color-btn-hover: #586e75;
+      --color-hover-border: #b58900;
+
+      --stat-best-text: #2aa198;
+      --stat-best-border: rgba(42, 161, 152, 0.3);
+      --stat-ao5-text: #859900;
+      --stat-ao5-border: rgba(133, 153, 0, 0.3);
+      --stat-ao12-text: #d33682;
+      --stat-ao12-border: rgba(211, 54, 130, 0.3);
+      --stat-mean3-text: #cb4b16;
+      --stat-mean3-border: rgba(203, 75, 22, 0.3);
+      --stat-stddev-text: #6c71c4;
+      --stat-stddev-border: rgba(108, 113, 196, 0.3);
+    }
+
+    [data-theme="cyberpunk"] {
+      --color-bg: #0d0221;
+      --color-panel: #190535;
+      --color-border: #ff007f;
+      --color-text: #00f5d4;
+      --color-subtext: #7b2cbf;
+      --color-accent: #ff007f;
+      --color-scrollbar-track: #080114;
+      --color-scrollbar-thumb: #ff007f;
+      --color-scrollbar-hover: #00f5d4;
+      --color-input-bg: #080114;
+      --color-btn-bg: #280854;
+      --color-btn-hover: #3b0c7a;
+      --color-hover-border: #00f5d4;
+
+      --stat-best-text: #00f5d4;
+      --stat-best-border: rgba(0, 245, 212, 0.4);
+      --stat-ao5-text: #ffe600;
+      --stat-ao5-border: rgba(255, 230, 0, 0.4);
+      --stat-ao12-text: #ff007f;
+      --stat-ao12-border: rgba(255, 0, 127, 0.4);
+      --stat-mean3-text: #ff8c00;
+      --stat-mean3-border: rgba(255, 140, 0, 0.4);
+      --stat-stddev-text: #d400ff;
+      --stat-stddev-border: rgba(212, 0, 255, 0.4);
+    }
+
+    body {
+      background-color: var(--color-bg);
+      color: var(--color-text);
+      touch-action: manipulation;
+    }
+
+    .bg-panel { background-color: var(--color-panel); }
+    .border-theme { border-color: var(--color-border); }
+    .text-sub { color: var(--color-subtext); }
+
+    .card-stat-best { border-color: var(--stat-best-border); }
+    .text-stat-best { color: var(--stat-best-text); }
+    .card-stat-ao5 { border-color: var(--stat-ao5-border); }
+    .text-stat-ao5 { color: var(--stat-ao5-text); }
+    .card-stat-ao12 { border-color: var(--stat-stddev-border); }
+    .text-stat-ao12 { color: var(--stat-stddev-text); }
+    .card-stat-mean3 { border-color: var(--stat-mean3-border); }
+    .text-stat-mean3 { color: var(--stat-mean3-text); }
+    .card-stat-stddev { border-color: var(--stat-stddev-border); }
+    .text-stat-stddev { color: var(--stat-stddev-text); }
+
+    .themed-select {
+      background-color: var(--color-input-bg);
+      border-color: var(--color-border);
+      color: var(--color-text);
+      appearance: none;
+      -webkit-appearance: none;
+      -moz-appearance: none;
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888888' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'></polyline></svg>");
+      background-repeat: no-repeat;
+      background-position: right 0.6rem center;
+      padding-right: 1.75rem !important;
+    }
+
+    .themed-checkbox {
+      appearance: none;
+      -webkit-appearance: none;
+      width: 0.9rem;
+      height: 0.9rem;
+      border: 1px solid var(--color-border);
+      border-radius: 0.25rem;
+      background-color: var(--color-input-bg);
+      display: inline-grid;
+      place-content: center;
+      cursor: pointer;
+    }
+
+    .themed-checkbox:checked {
+      background-color: var(--color-accent);
+      border-color: var(--color-accent);
+    }
+
+    .themed-checkbox:checked::before {
+      content: "";
+      width: 0.5rem;
+      height: 0.5rem;
+      transform: scale(1);
+      background-color: #000;
+      clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0%, 43% 62%);
+    }
+
+    .themed-btn {
+      background-color: var(--color-btn-bg);
+      color: var(--color-text);
+    }
+    .themed-btn:hover {
+      background-color: var(--color-btn-hover);
+    }
+
+    .solve-item:hover {
+      border-color: var(--color-hover-border);
+    }
+
+    twisty-player {
+      width: 100%;
+      height: 100%;
+      max-width: 180px;
+      max-height: 120px;
+    }
+
+    .timing-hide {
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease-in-out;
+    }
+
+    #timer {
+      transition: transform 0.25s ease-in-out, color 0.1s ease-in-out;
+      transform-origin: center center;
+    }
+
+    #timer.timer-zoomed {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(1.35);
+      z-index: 50;
+      margin: 0;
+    }
+
+    #solves-list {
+      scrollbar-width: thin;
+      scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);
+    }
+
+    #solves-list::-webkit-scrollbar { width: 6px; }
+    #solves-list::-webkit-scrollbar-track { background: var(--color-scrollbar-track); border-radius: 4px; }
+    #solves-list::-webkit-scrollbar-thumb { background-color: var(--color-scrollbar-thumb); border-radius: 4px; }
+    #solves-list::-webkit-scrollbar-thumb:hover { background-color: var(--color-scrollbar-hover); }
+
+    #solve-modal {
+      scrollbar-width: thin;
+      scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);
+    }
+
+    #solve-modal::-webkit-scrollbar { width: 6px; }
+    #solve-modal::-webkit-scrollbar-track { background: var(--color-scrollbar-track); border-radius: 4px; }
+    #solve-modal::-webkit-scrollbar-thumb { background-color: var(--color-scrollbar-thumb); border-radius: 4px; }
+    #solve-modal::-webkit-scrollbar-thumb:hover { background-color: var(--color-scrollbar-hover); }
+
+    #laps-display {
+      font-variant-numeric: tabular-nums;
+    }
+
+    #trend-canvas {
+      width: 100%;
+      height: 48px;
+    }
+
+    #solve-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(2px);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+
+    #solve-modal {
+      width: 100%;
+      max-width: 420px;
+      max-height: 90vh;
+      overflow-y: auto;
+      background: var(--color-panel);
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+    }
+
+    #solve-modal-visualizer twisty-player {
+      max-width: 100%;
+      max-height: 100%;
+    }
+
+    .modal-action-btn {
+      transition: background-color 0.12s, border-color 0.12s, color 0.12s;
+    }
+
+    #solve-comment-input {
+      background-color: var(--color-input-bg);
+      border-color: var(--color-border);
+      color: var(--color-text);
+    }
+    #solve-comment-input:focus {
+      outline: none;
+      border-color: var(--color-accent);
+    }
+
+    #sync-status {
+      font-size: 10px;
+      color: var(--color-subtext);
+      min-width: 60px;
+      text-align: right;
+    }
+  </style>
+
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512' width='512' height='512'%3E%3Cg transform='translate(256, 256) scale(5.4)'%3E%3Cpolygon points='0,-50 44,-25 0,0 -44,-25' fill='%23facc15' stroke='%230f172a' stroke-width='3' stroke-linejoin='round'/%3E%3Cline x1='-22' y1='-37.5' x2='22' y2='-12.5' stroke='%230f172a' stroke-width='3'/%3E%3Cline x1='-22' y1='-12.5' x2='22' y2='-37.5' stroke='%230f172a' stroke-width='3'/%3E%3Cpolygon points='-44,-25 0,0 0,50 -44,25' fill='%232563eb' stroke='%230f172a' stroke-width='3' stroke-linejoin='round'/%3E%3Cline x1='-44' y1='0' x2='0' y2='25' stroke='%230f172a' stroke-width='3'/%3E%3Cline x1='-22' y1='-12.5' x2='-22' y2='37.5' stroke='%230f172a' stroke-width='3'/%3E%3Cpolygon points='0,0 44,-25 44,25 0,50' fill='%23dc2626' stroke='%230f172a' stroke-width='3' stroke-linejoin='round'/%3E%3Cline x1='0' y1='25' x2='44' y2='0' stroke='%230f172a' stroke-width='3'/%3E%3Cline x1='22' y1='-12.5' x2='22' y2='37.5' stroke='%230f172a' stroke-width='3'/%3E%3C/g%3E%3C/svg%3E">
+</head>
+
+<body id="app-root" class="h-screen flex flex-col overflow-hidden font-sans select-none" data-theme="oled">
+<!-- Fullscreen Loading Overlay -->
+<div id="loading-overlay" class="fixed inset-0 z-50 flex flex-col items-center justify-center bg-app transition-opacity duration-300">
+  <div class="flex flex-col items-center gap-4">
+    <!-- Spinner Animation -->
+    <div class="w-12 h-12 border-4 border-subtext border-t-accent rounded-full animate-spin"></div>
+    <p id="loading-text" class="text-text font-medium text-lg">Loading your sessions...</p>
+  </div>
+</div>
+  <!-- Top Navigation / Toolbar -->
+  <header id="header-toolbar" class="w-full bg-panel border-b border-theme px-4 py-2 flex items-center z-30 transition-opacity">
+   <div class="w-full max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
+    <div class="flex items-center gap-4 flex-wrap">
+      <!-- Brand -->
+      <div class="flex items-center gap-2 pr-3 border-r border-theme">
+        <svg width="20" height="20" viewBox="0 0 512 512" class="shrink-0"><g transform="translate(256, 256) scale(5.4)"><polygon points="0,-50 44,-25 0,0 -44,-25" fill="#facc15" stroke="#0f172a" stroke-width="3" stroke-linejoin="round"/><line x1="-22" y1="-37.5" x2="22" y2="-12.5" stroke="#0f172a" stroke-width="3"/><line x1="-22" y1="-12.5" x2="22" y2="-37.5" stroke="#0f172a" stroke-width="3"/><polygon points="-44,-25 0,0 0,50 -44,25" fill="#2563eb" stroke="#0f172a" stroke-width="3" stroke-linejoin="round"/><line x1="-44" y1="0" x2="0" y2="25" stroke="#0f172a" stroke-width="3"/><line x1="-22" y1="-12.5" x2="-22" y2="37.5" stroke="#0f172a" stroke-width="3"/><polygon points="0,0 44,-25 44,25 0,50" fill="#dc2626" stroke="#0f172a" stroke-width="3" stroke-linejoin="round"/><line x1="0" y1="25" x2="44" y2="0" stroke="#0f172a" stroke-width="3"/><line x1="22" y1="-12.5" x2="22" y2="37.5" stroke="#0f172a" stroke-width="3"/></g></svg>
+        <span class="text-sm font-bold tracking-wide text-text hidden sm:inline">CubeTimer</span>
+      </div>
+
+      <div class="flex items-center gap-1.5">
+        <label for="event-select" class="text-xs font-medium text-sub">Event:</label>
+        <select id="event-select" class="themed-select border rounded px-2.5 py-1 text-xs font-semibold focus:outline-none">
+          <option value="222">2x2x2</option>
+          <option value="333">3x3x3</option>
+          <option value="444">4x4x4</option>
+          <option value="pyram">Pyraminx</option>
+          <option value="minx">Megaminx</option>
+          <option value="clock">Clock</option>
+        </select>
+      </div>
+
+      <div class="flex items-center gap-1.5">
+        <label for="session-select" class="text-xs font-medium text-sub">Session:</label>
+        <select id="session-select" class="themed-select border rounded px-2.5 py-1 text-xs font-semibold focus:outline-none"></select>
+
+        <div class="relative inline-block text-left">
+          <button id="session-menu-btn" title="Manage Sessions" aria-haspopup="true" aria-expanded="false"
+            onclick="const m=document.getElementById('session-menu'); m.classList.toggle('hidden'); this.setAttribute('aria-expanded', m.classList.contains('hidden') ? 'false' : 'true')"
+            class="px-2 py-1 themed-btn rounded text-xs font-bold transition flex items-center">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path d="M10 6a2 2 0 100-4 2 2 0 000 4zM10 12a2 2 0 100-4 2 2 0 000 4zM10 18a2 2 0 100-4 2 2 0 000 4z"/></svg>
+          </button>
+
+          <div id="session-menu" class="hidden absolute left-0 mt-2 w-44 bg-panel border border-theme rounded shadow-xl z-50 p-1 space-y-0.5">
+            <button id="add-session-btn" title="Create New Session" class="w-full text-left px-2.5 py-1.5 text-xs rounded themed-btn flex items-center gap-2 transition">
+              <span class="text-sm leading-none w-3.5 text-center">+</span> New Session
+            </button>
+            <button id="rename-session-btn" title="Rename Session" class="w-full text-left px-2.5 py-1.5 text-xs rounded themed-btn flex items-center gap-2 transition">
+              <span class="text-sm leading-none w-3.5 text-center">✏️</span> Rename Session
+            </button>
+            <div class="border-t border-theme my-1"></div>
+            <button id="delete-session-btn" title="Delete Session" class="w-full text-left px-2.5 py-1.5 text-xs rounded themed-btn hover:bg-red-600/30 hover:text-red-300 flex items-center gap-2 transition">
+              <span class="text-sm leading-none w-3.5 text-center">✕</span> Delete Session
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="hidden">
+        <label for="compare-select" class="text-xs font-medium text-sub">Compare:</label>
+        <select id="compare-select" class="themed-select border rounded px-2.5 py-1 text-xs font-semibold focus:outline-none">
+          <option value="">None</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-3 flex-wrap">
+      
+
+      <div class="relative inline-block text-left">
+        <button id="data-menu-btn" title="Export / Import" aria-haspopup="true" aria-expanded="false"
+          onclick="const m=document.getElementById('data-menu'); m.classList.toggle('hidden'); this.setAttribute('aria-expanded', m.classList.contains('hidden') ? 'false' : 'true')"
+          class="themed-btn px-2.5 py-1 rounded text-xs font-semibold flex items-center gap-1 transition">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+          <span></span>
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+        </button>
+
+        <div id="data-menu" class="hidden absolute right-0 mt-2 w-56 bg-panel border border-theme rounded shadow-xl z-50 p-1 space-y-0.5">
+          <div class="px-2.5 pt-1.5 pb-1 text-[10px] uppercase tracking-wider text-sub">Export</div>
+          <button id="export-json" class="w-full text-left px-2.5 py-1.5 text-xs rounded themed-btn transition" title="Export session as JSON">Export as JSON</button>
+          <button id="export-csv" class="w-full text-left px-2.5 py-1.5 text-xs rounded themed-btn transition" title="Export session as CSV">Export as CSV</button>
+
+          <div class="border-t border-theme my-1"></div>
+          <div class="px-2.5 pt-1 pb-1 text-[10px] uppercase tracking-wider text-sub">Import</div>
+          <button id="import-current-btn" class="w-full text-left px-2.5 py-1.5 text-xs rounded themed-btn transition" title="Import solves into the current session">Import to Current Session</button>
+          <button id="import-new-btn" class="w-full text-left px-2.5 py-1.5 text-xs rounded themed-btn transition" title="Import solves into a new session">Import to New Session</button>
+          <input type="file" id="import-file" accept=".json" class="hidden">
+
+          <div class="border-t border-theme my-1"></div>
+          <button id="clear-solves" class="w-full text-left px-2.5 py-1.5 text-xs rounded themed-btn hover:bg-red-600/30 hover:text-red-300 transition">Clear Session</button>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-1.5">
+        <label for="theme-select" class="text-xs font-medium text-sub">Theme:</label>
+        <select id="theme-select" class="themed-select border rounded px-2.5 py-1 text-xs font-semibold focus:outline-none">
+          <option value="dark">Dark Default</option>
+          <option value="oled">OLED Black</option>
+          <option value="solarized">Solarized Dark</option>
+          <option value="cyberpunk">Cyberpunk</option>
+        </select>
+      </div>
+
+      <div class="relative inline-block text-left">
+        <button id="options-dropdown-btn" onclick="document.getElementById('options-menu').classList.toggle('hidden')" class="themed-btn px-2.5 py-1 rounded text-xs font-semibold flex items-center gap-1 transition">
+          ⚙️ Options
+          <svg class="w-3 h-3 ml-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+        </button>
+
+        <div id="options-menu" class="hidden absolute right-0 mt-2 w-48 bg-panel border border-theme rounded shadow-xl z-50 p-2 space-y-2">
+          <label class="flex items-center gap-2 text-xs text-sub cursor-pointer hover:text-accent transition-colors p-1 rounded">
+            <input type="checkbox" id="inspection-toggle" class="themed-checkbox focus:ring-0">
+            <span>Inspection (15s)</span>
+          </label>
+
+          <label class="flex items-center gap-2 text-xs text-sub cursor-pointer hover:text-accent transition-colors p-1 rounded">
+            <input type="checkbox" id="hide-ui-toggle" class="themed-checkbox focus:ring-0">
+            <span>Hide UI while timing</span>
+          </label>
+
+          <label class="flex items-center gap-2 text-xs text-sub cursor-pointer hover:text-accent transition-colors p-1 rounded" title="Press L during a solve to record a split">
+            <input type="checkbox" id="laps-toggle" class="themed-checkbox focus:ring-0">
+            <span>Splits (press L)</span>
+          </label>
+        </div>
+      </div>
+<button id="next-scramble-btn" title="Next Scramble" class="themed-btn px-2.5 py-1 rounded text-xs font-semibold flex items-center gap-1 transition">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h5M20 20v-5h-5M4.5 9a8 8 0 0113.5-4.5L20 7M19.5 15a8 8 0 01-13.5 4.5L4 17"/></svg>
+       
+      </button>
+      <!-- Account corner -->
+      <div id="auth-container" class="flex items-center gap-1 pl-3 border-l border-theme">
+        <span id="sync-status"></span>
+        <button id="btn-login" onclick="loginWithGoogle()" style="display: inline-flex !important; flex-direction: row !important; align-items: center !important; justify-content: center !important; gap: 8px !important; white-space: nowrap !important;" class="bg-gray-800 hover:bg-gray-700 text-xs font-medium text-white px-3 py-1.5 rounded border border-gray-700 transition-colors"><!-- Official Google G SVG --><svg style="display: inline-block !important; flex-shrink: 0 !important; width: 16px !important; height: 16px !important;" viewBox="0 0 24 24" width="16" height="16" xmlns="http://www.w3.org/2000/svg"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg><span style="display: inline !important; line-height: 1 !important;"> Sign in</span></button>
+
+        <div id="user-profile" class="hidden items-center gap-2 bg-black/30 rounded-full pl-1 pr-2.5 py-1 border border-theme">
+          <img id="user-avatar" src="" alt="Profile" class="w-6 h-6 rounded-full border border-theme object-cover">
+          <span id="user-name" class="text-xs font-semibold text-sub max-w-[100px] truncate"></span>
+          <button onclick="logout()" class="px-1.5 py-0.5 text-[11px] themed-btn rounded text-sub hover:text-red-400 transition" title="Sign out">
+            Logout
+          </button>
+        </div>
+      </div>
+    </div>
+   </div>
+  </header>
+
+  <!-- Main Workspace -->
+  <div class="flex-1 flex flex-col md:flex-row overflow-hidden relative">
+
+    <!-- Solves & Statistics Sidebar -->
+    <aside id="sidebar" class="w-full md:w-80 bg-panel border-b md:border-b-0 md:border-r border-theme flex flex-col h-2/5 md:h-full z-10 shrink-0 transition-opacity">
+      <div class="p-4 border-b border-theme bg-black/40">
+        <h2 class="text-sm font-bold tracking-wide uppercase mb-3 text-sub">Statistics</h2>
+        <div class="grid grid-cols-2 gap-2 text-center mb-2">
+          <div class="card-stat-best bg-black/60 p-2 rounded border">
+            <div class="text-[10px] text-sub uppercase tracking-wider">Best</div>
+            <div id="stat-best" class="text-stat-best text-sm font-bold">--</div>
+          </div>
+          <div class="card-stat-mean3 bg-black/60 p-2 rounded border">
+            <div class="text-[10px] text-sub uppercase tracking-wider">Mo3</div>
+            <div id="stat-mean3" class="text-stat-mean3 text-sm font-bold">--</div>
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-2 text-center mb-2">
+          <div class="card-stat-ao5 bg-black/60 p-2 rounded border">
+            <div class="text-[10px] text-sub uppercase tracking-wider">Ao5</div>
+            <div id="stat-ao5" class="text-stat-ao5 text-sm font-bold">--</div>
+          </div>
+          <div class="card-stat-ao12 bg-black/60 p-2 rounded border">
+            <div class="text-[10px] text-sub uppercase tracking-wider">Ao12</div>
+            <div id="stat-ao12" class="text-stat-ao12 text-sm font-bold">--</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="px-4 py-2 bg-black/60 flex justify-between items-center text-xs text-sub border-b border-theme gap-2">
+        <span>Solves (<span id="solve-count">0</span>)</span>
+      </div>
+
+      <div id="solves-list" class="flex-1 overflow-y-auto p-3 space-y-2 pr-1.5">
+        <div id="empty-state" class="text-center text-sub text-sm py-8">
+          No solves recorded in this session.
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Timer Area -->
+    <main class="flex-1 flex flex-col justify-between items-center p-6 relative h-3/5 md:h-full min-w-0">
+      <div id="scramble-container" class="w-full flex justify-center items-start gap-2 min-h-[3.5rem] mt-2 px-4 transition-opacity">
+        <div id="scramble" title="Click to copy scramble" class="text-center font-mono text-base sm:text-lg md:text-xl lg:text-2xl break-words max-w-4xl leading-relaxed cursor-pointer select-none">
+          Loading scramble...
+        </div>
+      </div>
+
+      <div id="laps-display" class="text-xs text-sub text-center min-h-[1.2rem] font-mono"></div>
+
+      <div id="timer" class="text-7xl md:text-9xl font-bold font-mono tracking-tight my-auto z-20 select-none cursor-pointer">
+        0.00
+      </div>
+
+      <div id="visualizer-container" title="Click to copy scramble" class="absolute bottom-4 right-4 w-48 h-32 flex justify-center items-center bg-panel/80 backdrop-blur-sm rounded-lg p-1 border border-theme shadow-lg z-20 transition-opacity cursor-pointer">
+        <twisty-player 
+          id="visualizer" 
+          puzzle="3x3x3"
+          event="333" 
+          visualization="2D" 
+          hint-facelets="none"
+          control-panel="none" 
+          background="none"
+          style="pointer-events: none;">
+        </twisty-player>
+      </div>
+    </main>
+
+  </div>
+
+  <!-- Solve Detail Modal (hidden by default) -->
+  <div id="solve-modal-backdrop" class="hidden" style="display:none;">
+    <div id="solve-modal">
+      <!-- Header -->
+      <div class="flex items-center justify-between px-4 py-3 border-b border-theme">
+        <div class="flex items-center gap-2">
+          <span id="modal-solve-num" class="text-xs text-sub font-mono">#1</span>
+          <span id="modal-solve-time" class="font-mono font-bold text-xl"></span>
+        </div>
+        <button id="modal-close-btn" class="text-sub hover:text-red-400 text-lg leading-none px-1" title="Close">✕</button>
+      </div>
+
+      <!-- Action buttons row -->
+      <div class="flex items-center gap-2 px-4 py-3 border-b border-theme">
+        <button data-action="penalty-plus2" class="modal-action-btn flex-1 px-2 py-1.5 text-xs font-semibold rounded border border-theme hover:bg-yellow-600/30 hover:border-yellow-500 text-sub">+2</button>
+        <button data-action="penalty-dnf" class="modal-action-btn flex-1 px-2 py-1.5 text-xs font-semibold rounded border border-theme hover:bg-red-600/30 hover:border-red-500 text-sub">DNF</button>
+        <button data-action="redo-scramble" class="modal-action-btn flex-1 px-2 py-1.5 text-xs font-semibold rounded border border-theme hover:bg-emerald-600/30 hover:border-emerald-500 text-sub">↻ Redo</button>
+        <button data-action="delete-solve" class="modal-action-btn flex-1 px-2 py-1.5 text-xs font-semibold rounded border border-theme hover:bg-red-800/40 hover:border-red-600 text-sub hover:text-red-300">✕ Delete</button>
+      </div>
+
+      <!-- Scramble + visualizer -->
+      <div class="px-4 py-3 border-b border-theme">
+        <div class="text-[10px] uppercase tracking-wider text-sub mb-1.5">Scramble</div>
+        <div id="modal-scramble-text" class="font-mono text-sm break-words leading-relaxed mb-3"></div>
+        <div id="solve-modal-visualizer" class="w-full h-40 bg-black/30 rounded border border-theme flex items-center justify-center"></div>
+      </div>
+
+      <!-- Splits (only shown if present) -->
+      <div id="modal-laps-section" class="px-4 py-3 border-b border-theme hidden">
+        <div class="text-[10px] uppercase tracking-wider text-sub mb-1.5">Splits</div>
+        <div id="modal-laps-text" class="text-xs font-mono text-sub"></div>
+      </div>
+
+      <!-- Date/time -->
+      <div class="px-4 py-3 border-b border-theme flex justify-between items-center">
+        <span class="text-[10px] uppercase tracking-wider text-sub">Date &amp; Time</span>
+        <span id="modal-datetime" class="text-xs font-mono text-sub"></span>
+      </div>
+
+      <!-- Comment -->
+      <div class="px-4 py-3">
+        <div class="text-[10px] uppercase tracking-wider text-sub mb-1.5">Comment</div>
+        <textarea id="solve-comment-input" class="w-full text-sm rounded border px-2.5 py-2 resize-none focus:outline-none" rows="3" placeholder="Add a note about this solve..."></textarea>
+      </div>
+    </div>
+  </div>
+
+  <!-- App Core Script -->
+  <script>
+    // ---------- Persistent storage layer (artifact key-value storage) ----------
+    const STORE_KEY_SESSIONS = "cube_sessions_v2";
+    const STORE_KEY_SETTINGS = "cube_settings_v2";
+
+    async function loadSessions() {
+      try {
+        const res = await window.storage.get(STORE_KEY_SESSIONS, false);
+        return res ? JSON.parse(res.value) : null;
+      } catch (e) {
+        return null;
+      }
+    }
+    async function saveSessions(sessions) {
+      try {
+        await window.storage.set(STORE_KEY_SESSIONS, JSON.stringify(sessions), false);
+      } catch (e) {
+        console.error("Failed to save sessions:", e);
+      }
+    }
+    async function saveSettings(settings) {
+  try {
+    const data = JSON.stringify(settings);
+    // Use window.storage if available (e.g. extension environment), otherwise fallback to standard localStorage
+    if (typeof window.storage !== "undefined" && typeof window.storage.set === "function") {
+      await window.storage.set(STORE_KEY_SETTINGS, data);
+    } else {
+      localStorage.setItem(STORE_KEY_SETTINGS, data);
+    }
+  } catch (e) {
+    console.error("Failed to save settings:", e);
+  }
+}
+
+async function loadSettings() {
+  try {
+    let data = null;
+    if (typeof window.storage !== "undefined" && typeof window.storage.get === "function") {
+      data = await window.storage.get(STORE_KEY_SETTINGS);
+    } else {
+      data = localStorage.getItem(STORE_KEY_SETTINGS);
+    }
+    return data ? JSON.parse(data) : null;
+  } catch (e) {
+    console.error("Failed to load settings:", e);
+    return null;
+  }
+}
+
+    // ---------- State ----------
+    // `sessions` is the single source of truth. window.sessions is kept as an
+    // ALIAS to the same object (see setSessions()) so the Firebase module,
+    // which reads/writes window.sessions, is never operating on a different
+    // object than the render/save/UI code below.
+    let sessions = { "default": { name: "Main Session", event: "333", solves: [] } };
+    function setSessions(newSessions) {
+      sessions = newSessions;
+      window.sessions = sessions;
+    }
+    setSessions(sessions);
+
+    let currentSessionId = "default";
+    let compareSessionId = "";
+    let hideUiWhileTiming = false;
+    let inspectionEnabled = false;
+    let lapsEnabled = false;
+    let currentTheme = "oled";
+
+    const timerEl = document.getElementById("timer");
+    const appRoot = document.getElementById("app-root");
+    const headerToolbar = document.getElementById("header-toolbar");
+    const sidebar = document.getElementById("sidebar");
+    const scrambleContainer = document.getElementById("scramble-container");
+    const visualizerContainer = document.getElementById("visualizer-container");
+    const lapsDisplay = document.getElementById("laps-display");
+    const syncStatusEl = document.getElementById("sync-status");
+
+    let running = false;
+    let inspecting = false;
+    let holding = false;
+    let ready = false;
+
+    let startTime = 0;
+    let inspectionStartTime = 0;
+    let inspectionPenalty = "none";
+
+    let holdTimeout = null;
+    let animationFrame = null;
+    let inspectionInterval = null;
+
+    let currentLaps = [];
+
+    function formatTime(ms, penalty = "none") {
+      if (penalty === "DNF") return "DNF";
+
+      let displayMs = ms;
+      if (penalty === "+2") displayMs += 2000;
+
+      const seconds = displayMs / 1000;
+      if (seconds < 60) {
+        return seconds.toFixed(2) + (penalty === "+2" ? "+" : "");
+      }
+      const mins = Math.floor(seconds / 60);
+      const secs = (seconds % 60).toFixed(2).padStart(5, "0");
+      return `${mins}:${secs}${penalty === "+2" ? "+" : ""}`;
+    }
+
+    function solveMs(s) {
+      if (s.penalty === "DNF") return Infinity;
+      return s.time + (s.penalty === "+2" ? 2000 : 0);
+    }
+
+    function calculateAverage(timesList, count) {
+      if (timesList.length < count) return "--";
+      const recent = timesList.slice(0, count);
+
+      const dnfCount = recent.filter(s => s.penalty === "DNF").length;
+      if (dnfCount > 1) return "DNF";
+
+      const numericTimes = recent.map(solveMs);
+      const max = Math.max(...numericTimes);
+      const min = Math.min(...numericTimes);
+
+      const validTimes = [...numericTimes];
+      validTimes.splice(validTimes.indexOf(max), 1);
+      validTimes.splice(validTimes.indexOf(min), 1);
+
+      const sum = validTimes.reduce((a, b) => a + b, 0);
+      const avg = sum / (count - 2);
+
+      return formatTime(avg);
+    }
+
+    function calculateMeanOf3(timesList) {
+      if (timesList.length < 3) return "--";
+      const recent = timesList.slice(0, 3);
+      if (recent.some(s => s.penalty === "DNF")) return "DNF";
+      const sum = recent.reduce((a, s) => a + solveMs(s), 0);
+      return formatTime(sum / 3);
+    }
+
+    function calculateStdDev(timesList, count = 12) {
+      const recent = timesList.slice(0, count).filter(s => s.penalty !== "DNF");
+      if (recent.length < 2) return "--";
+      const times = recent.map(solveMs);
+      const mean = times.reduce((a, b) => a + b, 0) / times.length;
+      const variance = times.reduce((a, b) => a + (b - mean) ** 2, 0) / times.length;
+      const sd = Math.sqrt(variance);
+      return (sd / 1000).toFixed(2) + "s";
+    }
+
+    function getSolves(sessionId = currentSessionId) {
+      return sessions[sessionId]?.solves || [];
+    }
+
+    function drawTrend(solves) {
+      const canvas = document.getElementById("trend-canvas");
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const valid = solves.slice(0, 30).filter(s => s.penalty !== "DNF").map(solveMs).reverse();
+      if (valid.length < 2) return;
+
+      const min = Math.min(...valid);
+      const max = Math.max(...valid);
+      const range = (max - min) || 1;
+      const pad = 4;
+
+      ctx.beginPath();
+      ctx.strokeStyle = getComputedStyle(appRoot).getPropertyValue("--color-accent").trim() || "#3b82f6";
+      ctx.lineWidth = 1.5;
+      valid.forEach((t, i) => {
+        const x = pad + (i / (valid.length - 1)) * (w - pad * 2);
+        const y = h - pad - ((t - min) / range) * (h - pad * 2);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    window.addEventListener("click", (e) => {
+      const btn = document.getElementById("options-dropdown-btn");
+      const menu = document.getElementById("options-menu");
+      if (menu && !menu.classList.contains("hidden") && !btn.contains(e.target) && !menu.contains(e.target)) {
+        menu.classList.add("hidden");
+      }
+
+      const sBtn = document.getElementById("session-menu-btn");
+      const sMenu = document.getElementById("session-menu");
+      if (sMenu && !sMenu.classList.contains("hidden") && !sBtn.contains(e.target) && !sMenu.contains(e.target)) {
+        sMenu.classList.add("hidden");
+        sBtn.setAttribute("aria-expanded", "false");
+      }
+
+      const dBtn = document.getElementById("data-menu-btn");
+      const dMenu = document.getElementById("data-menu");
+      if (dMenu && !dMenu.classList.contains("hidden") && !dBtn.contains(e.target) && !dMenu.contains(e.target)) {
+        dMenu.classList.add("hidden");
+        dBtn.setAttribute("aria-expanded", "false");
+      }
+    });
+
+    // Close the session/data menus whenever an item inside them is clicked
+    document.getElementById("session-menu").addEventListener("click", (e) => {
+      if (e.target.closest("button")) document.getElementById("session-menu").classList.add("hidden");
+    });
+    document.getElementById("data-menu").addEventListener("click", (e) => {
+      if (e.target.closest("button") && e.target.id !== "import-file") {
+        document.getElementById("data-menu").classList.add("hidden");
+      }
+    });
+
+    // ---------- Scramble quick actions ----------
+    async function copyCurrentScramble(triggerEl) {
+      const text = window.getCurrentScramble ? window.getCurrentScramble() : "";
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        if (triggerEl) {
+          const original = triggerEl.title;
+          triggerEl.title = "Copied!";
+          setTimeout(() => { triggerEl.title = original; }, 1200);
+        }
+      } catch (err) {
+        console.warn("Copy failed:", err);
+      }
+    }
+
+    document.getElementById("scramble").addEventListener("click", (e) => {
+      copyCurrentScramble(e.currentTarget);
+    });
+
+    document.getElementById("visualizer-container").addEventListener("click", (e) => {
+      copyCurrentScramble(e.currentTarget);
+    });
+
+    document.getElementById("next-scramble-btn").addEventListener("click", () => {
+      if (window.updateScramble) window.updateScramble();
+    });
+
+    function updateStats() {
+      const solves = getSolves();
+      const bestEl = document.getElementById("stat-best");
+      const ao5El = document.getElementById("stat-ao5");
+      const ao12El = document.getElementById("stat-ao12");
+      const mean3El = document.getElementById("stat-mean3");
+      const stddevEl = document.getElementById("stat-stddev");
+      const countEl = document.getElementById("solve-count");
+
+      countEl.textContent = solves.length;
+
+      if (solves.length === 0) {
+        bestEl.textContent = "--";
+        ao5El.textContent = "--";
+        ao12El.textContent = "--";
+        mean3El.textContent = "--";
+        stddevEl.textContent = "--";
+        drawTrend([]);
+        updateCompareRow();
+        return;
+      }
+
+      const validSolves = solves.filter(s => s.penalty !== "DNF");
+      bestEl.textContent = validSolves.length === 0 ? "DNF" : formatTime(Math.min(...validSolves.map(solveMs)));
+
+      ao5El.textContent = calculateAverage(solves, 5);
+      ao12El.textContent = calculateAverage(solves, 12);
+      mean3El.textContent = calculateMeanOf3(solves);
+      stddevEl.textContent = calculateStdDev(solves);
+
+      drawTrend(solves);
+      updateCompareRow();
+    }
+
+    function updateCompareRow() {
+      const row = document.getElementById("compare-row");
+      const label = document.getElementById("compare-label");
+      const values = document.getElementById("compare-values");
+      if (!compareSessionId || !sessions[compareSessionId]) {
+        row.classList.add("hidden");
+        return;
+      }
+      row.classList.remove("hidden");
+      const otherSolves = getSolves(compareSessionId);
+      label.textContent = `vs ${sessions[compareSessionId].name}`;
+      const myAo12 = calculateAverage(getSolves(), 12);
+      const otherAo12 = calculateAverage(otherSolves, 12);
+      values.textContent = `${myAo12} vs ${otherAo12}`;
+    }
+
+    function renderSolves() {
+      const listEl = document.getElementById("solves-list");
+      const solves = getSolves();
+      listEl.innerHTML = "";
+
+      if (solves.length === 0) {
+        listEl.innerHTML = `<div class="text-center text-sub text-sm py-8">No solves recorded in this session.</div>`;
+        updateStats();
+        return;
+      }
+
+      solves.forEach((solve, index) => {
+        const item = document.createElement("div");
+        item.className = "solve-item group relative flex items-center justify-between gap-2 p-2.5 bg-black/40 rounded border border-theme transition duration-150 cursor-pointer";
+        item.dataset.index = index;
+
+        const solveNum = solves.length - index;
+        const timeDisplay = formatTime(solve.time, solve.penalty);
+
+        item.innerHTML = `
+          <div class="flex items-center gap-3 min-w-0">
+            <span class="text-xs text-sub font-mono w-6 shrink-0">#${solveNum}</span>
+            <span class="font-mono font-semibold truncate">${timeDisplay}</span>
+          </div>
+          <span class="text-[10px] text-sub shrink-0">${new Date(solve.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+        `;
+        listEl.appendChild(item);
+      });
+
+      updateStats();
+    }
+
+    document.getElementById("solves-list").addEventListener("click", (e) => {
+      const item = e.target.closest(".solve-item");
+      if (!item) return;
+      const index = parseInt(item.dataset.index, 10);
+      openSolveModal(index);
+    });
+
+    // ---------- Solve Detail Modal ----------
+    const modalBackdrop = document.getElementById("solve-modal-backdrop");
+    const modalSolveNum = document.getElementById("modal-solve-num");
+    const modalSolveTime = document.getElementById("modal-solve-time");
+    const modalScrambleText = document.getElementById("modal-scramble-text");
+    const modalVisualizer = document.getElementById("solve-modal-visualizer");
+    const modalLapsSection = document.getElementById("modal-laps-section");
+    const modalLapsText = document.getElementById("modal-laps-text");
+    const modalDatetime = document.getElementById("modal-datetime");
+    const modalCommentInput = document.getElementById("solve-comment-input");
+
+    let modalOpenIndex = null;
+
+    function refreshModalContent() {
+      const solves = getSolves();
+      const solve = solves[modalOpenIndex];
+      if (!solve) { closeSolveModal(); return; }
+
+      const solveNum = solves.length - modalOpenIndex;
+      modalSolveNum.textContent = `#${solveNum}`;
+      modalSolveTime.textContent = formatTime(solve.time, solve.penalty);
+      modalSolveTime.className = "font-mono font-bold text-xl " +
+        (solve.penalty === "DNF" ? "text-red-400" : solve.penalty === "+2" ? "text-yellow-400" : "");
+
+      modalScrambleText.textContent = solve.scramble || "(no scramble recorded)";
+
+      if (solve.laps && solve.laps.length) {
+        modalLapsSection.classList.remove("hidden");
+        modalLapsText.textContent = solve.laps.map((l, i) => `L${i + 1}: ${(l / 1000).toFixed(2)}s`).join("   ·   ");
+      } else {
+        modalLapsSection.classList.add("hidden");
+      }
+
+      modalDatetime.textContent = new Date(solve.date).toLocaleString();
+      modalCommentInput.value = solve.comment || "";
+
+      const plus2Btn = document.querySelector('#solve-modal [data-action="penalty-plus2"]');
+      const dnfBtn = document.querySelector('#solve-modal [data-action="penalty-dnf"]');
+      plus2Btn.className = "modal-action-btn flex-1 px-2 py-1.5 text-xs font-semibold rounded border hover:bg-yellow-600/30 hover:border-yellow-500 " +
+        (solve.penalty === "+2" ? "bg-yellow-600/40 border-yellow-500 text-yellow-300" : "border-theme text-sub");
+      dnfBtn.className = "modal-action-btn flex-1 px-2 py-1.5 text-xs font-semibold rounded border hover:bg-red-600/30 hover:border-red-500 " +
+        (solve.penalty === "DNF" ? "bg-red-600/40 border-red-500 text-red-300" : "border-theme text-sub");
+    }
+
+    function openSolveModal(index) {
+      modalOpenIndex = index;
+      modalVisualizer.innerHTML = "";
+      refreshModalContent();
+
+      modalBackdrop.classList.remove("hidden");
+      modalBackdrop.style.display = "flex";
+
+      const solve = getSolves()[index];
+      if (solve && window.renderThumbnail) {
+        window.renderThumbnail(solve.scramble, solve.event || "333", modalVisualizer);
+      }
+    }
+
+    function closeSolveModal() {
+      if (modalOpenIndex !== null) {
+        commitModalComment();
+      }
+      modalBackdrop.classList.add("hidden");
+      modalBackdrop.style.display = "none";
+      modalOpenIndex = null;
+      modalVisualizer.innerHTML = "";
+    }
+
+    function commitModalComment() {
+      if (modalOpenIndex === null) return;
+      const solves = getSolves();
+      const solve = solves[modalOpenIndex];
+      if (!solve) return;
+      const newComment = modalCommentInput.value.trim();
+      if (newComment !== (solve.comment || "")) {
+        solve.comment = newComment;
+        saveData();
+        renderSolves();
+      }
+    }
+
+    document.getElementById("modal-close-btn").addEventListener("click", closeSolveModal);
+    modalBackdrop.addEventListener("click", (e) => {
+      if (e.target === modalBackdrop) closeSolveModal();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.code === "Escape" && !modalBackdrop.classList.contains("hidden")) {
+        closeSolveModal();
+      }
+    });
+    modalCommentInput.addEventListener("blur", commitModalComment);
+
+    document.getElementById("solve-modal").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-action]");
+      if (!btn || modalOpenIndex === null) return;
+      const solves = getSolves();
+      const solve = solves[modalOpenIndex];
+      if (!solve) return;
+      const action = btn.dataset.action;
+
+      switch (action) {
+        case "penalty-plus2":
+          solve.penalty = solve.penalty === "+2" ? "none" : "+2";
+          saveData(); renderSolves(); refreshModalContent();
+          break;
+        case "penalty-dnf":
+          solve.penalty = solve.penalty === "DNF" ? "none" : "DNF";
+          saveData(); renderSolves(); refreshModalContent();
+          break;
+        case "redo-scramble":
+          if (window.updateScramble) {
+            window.updateScramble(solve.scramble, false, solve.event || "333");
+          }
+          closeSolveModal();
+          break;
+        case "delete-solve":
+          solves.splice(modalOpenIndex, 1);
+          saveData(); renderSolves();
+          closeSolveModal();
+          break;
+      }
+    });
+
+    function addSolve(timeMs, penalty = "none") {
+      const currentScramble = window.getCurrentScramble ? window.getCurrentScramble() : "";
+      const currentEvt = window.getCurrentEvent ? window.getCurrentEvent() : "333";
+      sessions[currentSessionId].solves.unshift({
+        time: timeMs,
+        scramble: currentScramble,
+        event: currentEvt,
+        penalty: penalty,
+        laps: currentLaps.slice(),
+        comment: "",
+        date: new Date().toISOString()
+      });
+      currentLaps = [];
+      saveData();
+      renderSolves();
+    }
+
+    document.getElementById("clear-solves").addEventListener("click", () => {
+      const solves = getSolves();
+      if (solves.length === 0) return;
+      if (confirm("Clear all solves in the current session?")) {
+        sessions[currentSessionId].solves = [];
+        saveData();
+        renderSolves();
+      }
+    });
+
+    // ---------- Export / Import ----------
+    function downloadBlob(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById("export-json").addEventListener("click", () => {
+  const data = {
+    session: sessions[currentSessionId].name,
+    event: sessions[currentSessionId].event,
+    solves: getSolves()
+  };
+  downloadBlob(
+    JSON.stringify(data, null, 2),
+    `${sessions[currentSessionId].name.replace(/\s+/g, "_")}.json`,
+    "application/json"
+  );
+});
+
+document.getElementById("export-csv").addEventListener("click", () => {
+  const solves = getSolves();
+  const header = "index,time_ms,penalty,event,scramble,date,comment\n";
+  const rows = solves.map((s, i) => {
+    const idx = solves.length - i;
+    const scramble = `"${(s.scramble || "").replace(/"/g, '""')}"`;
+    const comment = `"${(s.comment || "").replace(/"/g, '""')}"`;
+    return [idx, (s.time * 1000).toFixed(0), s.penalty || "", s.event || "333", scramble, s.date || "", comment].join(",");
+  }).join("\n");
+  downloadBlob(
+    header + rows,
+    `${sessions[currentSessionId].name.replace(/\s+/g, "_")}.csv`,
+    "text/csv"
+  );
+});
+
+let importTargetMode = "current";
+
+document.getElementById("import-current-btn").addEventListener("click", () => {
+  importTargetMode = "current";
+  document.getElementById("import-file").click();
+});
+
+document.getElementById("import-new-btn").addEventListener("click", () => {
+  importTargetMode = "new";
+  document.getElementById("import-file").click();
+});
+
+document.getElementById("import-file").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+
+    // 1. HANDLE CSTIMER NATIVE EXPORT FILE
+    if (data.properties || data.session1 || data.session16) {
+      let importedCount = 0;
+      let sessionDataMap = {};
+
+      try {
+        if (data.properties && data.properties.sessionData) {
+          sessionDataMap = JSON.parse(data.properties.sessionData);
+        }
+      } catch (err) {
+        console.warn("Failed to parse csTimer sessionData properties:", err);
+      }
+
+      Object.keys(data).forEach((key) => {
+        if (key.startsWith("session") && Array.isArray(data[key]) && data[key].length > 0) {
+          const sessionNum = key.replace("session", "");
+          const sessionMeta = sessionDataMap[sessionNum];
+          const sessionName = sessionMeta?.name ? `csTimer ${sessionMeta.name}` : `csTimer ${sessionNum}`;
+
+          const formattedSolves = data[key].map((item) => {
+            // csTimer format: [[penalty, time_in_ms], scramble, comment, timestamp]
+            let timeInSeconds = 0;
+            let penaltyVal = 0;
+
+            if (Array.isArray(item[0])) {
+              penaltyVal = item[0][0];
+              // Convert milliseconds to seconds
+              timeInSeconds = (Number(item[0][1]) || 0) / 1000;
+            } else if (typeof item[0] === "number") {
+              timeInSeconds = item[0] / 1000;
+            }
+
+            const scramble = item[1] || "";
+            const comment = item[2] || "";
+            const timestamp = item[3] ? item[3] * 1000 : Date.now();
+
+            return {
+              time: parseFloat(timeInSeconds.toFixed(2)),
+              scramble: scramble,
+              comment: comment,
+              penalty: penaltyVal === 2000 ? "+2" : penaltyVal === -1 ? "DNF" : "",
+              date: timestamp
+            };
+          });
+
+          const newSessionId = `cstimer_${Date.now()}_${sessionNum}`;
+          sessions[newSessionId] = {
+            name: sessionName,
+            event: "333",
+            solves: formattedSolves
+          };
+
+          importedCount += formattedSolves.length;
+        }
+      });
+
+      if (importedCount === 0) {
+        throw new Error("No solves found inside csTimer file.");
+      }
+
+      saveData();
+      renderSessionsDropdown();
+
+      // Switch UI to the newly imported session
+      const importedKeys = Object.keys(sessions).filter(k => k.startsWith("cstimer_"));
+      if (importedKeys.length > 0) {
+        await switchSession(importedKeys[importedKeys.length - 1]);
+      }
+
+      alert(`Successfully imported csTimer file with ${importedCount} solves!`);
+      return;
+    }
+
+    // 2. HANDLE APP'S CUSTOM FORMAT OR PLAIN ARRAY FORMAT
+    const importedSolves = (Array.isArray(data) ? data : data.solves)?.map(s => ({
+      ...s,
+      time: parseFloat(Number(s.time).toFixed(2)) || 0
+    }));
+
+    if (!Array.isArray(importedSolves)) {
+      throw new Error("No solves array found in file.");
+    }
+
+    if (importTargetMode === "new") {
+      const newId = "session_" + Date.now();
+      const newName = `Imported ${new Date().toLocaleDateString()}`;
+      sessions[newId] = {
+        name: newName,
+        event: sessions[currentSessionId].event || "333",
+        solves: importedSolves
+      };
+      saveData();
+      renderSessionsDropdown();
+      await switchSession(newId);
+      alert(`Imported ${importedSolves.length} solves into new session "${newName}".`);
+    } else {
+      sessions[currentSessionId].solves = [...importedSolves, ...(sessions[currentSessionId].solves || [])];
+      saveData();
+      renderSolves();
+      if (typeof updateStats === "function") updateStats();
+      alert(`Imported ${importedSolves.length} solves into current session.`);
+    }
+
+  } catch (err) {
+    alert("Import failed: " + err.message);
+  } finally {
+    e.target.value = "";
+  }
+});
+
+    const sessionSelect = document.getElementById("session-select");
+    const eventSelect = document.getElementById("event-select");
+    const compareSelect = document.getElementById("compare-select");
+
+    function renderSessionsDropdown() {
+      sessionSelect.innerHTML = "";
+      compareSelect.innerHTML = `<option value="">None</option>`;
+      Object.keys(sessions).forEach(id => {
+        const option = document.createElement("option");
+        option.value = id;
+        option.textContent = sessions[id].name;
+        if (id === currentSessionId) option.selected = true;
+        sessionSelect.appendChild(option);
+
+        if (id !== currentSessionId) {
+          const cmpOption = document.createElement("option");
+          cmpOption.value = id;
+          cmpOption.textContent = sessions[id].name;
+          if (id === compareSessionId) cmpOption.selected = true;
+          compareSelect.appendChild(cmpOption);
+        }
+      });
+    }
+
+    async function switchSession(sessionId) {
+      if (!sessions[sessionId]) return;
+      currentSessionId = sessionId;
+      if (compareSessionId === sessionId) compareSessionId = "";
+      await saveSettings(currentSettingsSnapshot());
+
+      const targetEvent = sessions[currentSessionId].event || "333";
+      eventSelect.value = targetEvent;
+      if (window.setEvent) {
+        await window.setEvent(targetEvent);
+      }
+
+      renderSessionsDropdown();
+      renderSolves();
+    }
+
+    sessionSelect.addEventListener("change", (e) => {
+      switchSession(e.target.value);
+    });
+
+    compareSelect.addEventListener("change", (e) => {
+      compareSessionId = e.target.value;
+      saveSettings(currentSettingsSnapshot());
+      updateStats();
+    });
+
+    document.getElementById("add-session-btn").addEventListener("click", () => {
+      const name = prompt("Enter new session name:", `Session ${Object.keys(sessions).length + 1}`);
+      if (!name) return;
+      const id = "session_" + Date.now();
+      const currentEvt = eventSelect.value;
+      sessions[id] = { name, event: currentEvt, solves: [] };
+      saveData();
+      renderSessionsDropdown();
+      switchSession(id);
+    });
+
+    document.getElementById("rename-session-btn").addEventListener("click", () => {
+      const currentName = sessions[currentSessionId].name;
+      const newName = prompt("Rename session:", currentName);
+      if (newName && newName.trim() !== "") {
+        sessions[currentSessionId].name = newName.trim();
+        saveData();
+        renderSessionsDropdown();
+      }
+    });
+
+    document.getElementById("delete-session-btn").addEventListener("click", async () => {
+  const sessionKeys = Object.keys(sessions);
+
+  // 1. Prevent deleting if only one session exists
+  if (sessionKeys.length <= 1) {
+    alert("You must keep at least one session!");
+    return;
+  }
+
+  const currentName = sessions[currentSessionId].name;
+  const solveCount = (sessions[currentSessionId].solves || []).length;
+
+  // 2. Ask for confirmation before deleting
+  const confirmDelete = confirm(
+    `Are you sure you want to delete "${currentName}" with ${solveCount} solves?`
+  );
+
+  if (!confirmDelete) return;
+
+  // 3. Delete the active session from memory
+  const idToDelete = currentSessionId;
+  delete sessions[idToDelete];
+
+  // 4. Select a remaining session
+  const remainingKeys = Object.keys(sessions);
+  const nextSessionId = remainingKeys[0];
+
+  // 5. Save state locally and sync deletion to Firebase
+  saveData();
+
+  // 6. Switch UI to the remaining session
+  await switchSession(nextSessionId);
+});
+
+    eventSelect.addEventListener("change", (e) => {
+      const selectedEvent = e.target.value;
+      sessions[currentSessionId].event = selectedEvent;
+      saveData();
+      if (window.setEvent) {
+        window.setEvent(selectedEvent);
+      }
+    });
+
+    const themeSelect = document.getElementById("theme-select");
+    const hideUiToggle = document.getElementById("hide-ui-toggle");
+    const inspectionToggle = document.getElementById("inspection-toggle");
+    const lapsToggle = document.getElementById("laps-toggle");
+
+    function currentSettingsSnapshot() {
+      return {
+        theme: currentTheme,
+        hideUi: hideUiWhileTiming,
+        inspection: inspectionEnabled,
+        laps: lapsEnabled,
+        currentSessionId,
+        compareSessionId
+      };
+    }
+
+    function applyTheme(theme) {
+      currentTheme = theme;
+      appRoot.setAttribute("data-theme", theme);
+      themeSelect.value = theme;
+      saveSettings(currentSettingsSnapshot());
+      updateStats();
+    }
+
+    themeSelect.addEventListener("change", (e) => applyTheme(e.target.value));
+
+    hideUiToggle.addEventListener("change", (e) => {
+      hideUiWhileTiming = e.target.checked;
+      saveSettings(currentSettingsSnapshot());
+    });
+
+    inspectionToggle.addEventListener("change", (e) => {
+      inspectionEnabled = e.target.checked;
+      saveSettings(currentSettingsSnapshot());
+    });
+
+    lapsToggle.addEventListener("change", (e) => {
+      lapsEnabled = e.target.checked;
+      saveSettings(currentSettingsSnapshot());
+    });
+
+    function toggleTimingUiHide(hide) {
+      if (!hideUiWhileTiming) return;
+      if (hide) {
+        headerToolbar.classList.add("timing-hide");
+        sidebar.classList.add("timing-hide");
+        scrambleContainer.classList.add("timing-hide");
+        visualizerContainer.classList.add("timing-hide");
+      } else {
+        headerToolbar.classList.remove("timing-hide");
+        sidebar.classList.remove("timing-hide");
+        scrambleContainer.classList.remove("timing-hide");
+        visualizerContainer.classList.remove("timing-hide");
+      }
+    }
+
+    function toggleTimerZoom(enable) {
+      if (!hideUiWhileTiming) return;
+      if (enable) {
+        timerEl.classList.add("timer-zoomed");
+        toggleTimingUiHide(true);
+      } else {
+        timerEl.classList.remove("timer-zoomed");
+        if (!running) {
+          toggleTimingUiHide(false);
+        }
+      }
+    }
+
+    function cancelTimerHoldingState() {
+      holding = false;
+      ready = false;
+      clearTimeout(holdTimeout);
+      stopInspection();
+
+      inspectionPenalty = "none";
+      currentLaps = [];
+      lapsDisplay.textContent = "";
+
+      toggleTimingUiHide(false);
+      toggleTimerZoom(false);
+
+      timerEl.style.color = "var(--color-text)";
+      timerEl.textContent = "0.00";
+    }
+
+    function startInspection() {
+      inspecting = true;
+      inspectionPenalty = "none";
+      inspectionStartTime = performance.now();
+      timerEl.style.color = "#f97316";
+
+      toggleTimingUiHide(false);
+      toggleTimerZoom(false);
+
+      inspectionInterval = setInterval(() => {
+        const elapsedSecs = Math.floor((performance.now() - inspectionStartTime) / 1000);
+
+        if (elapsedSecs < 15) {
+          timerEl.textContent = (15 - elapsedSecs).toString();
+          inspectionPenalty = "none";
+        } else if (elapsedSecs < 17) {
+          timerEl.textContent = "+2";
+          inspectionPenalty = "+2";
+        } else {
+          timerEl.textContent = "DNF";
+          inspectionPenalty = "DNF";
+        }
+      }, 100);
+    }
+
+    function stopInspection() {
+      inspecting = false;
+      clearInterval(inspectionInterval);
+    }
+
+    // ---------- Unified save path ----------
+    // saveData() is the ONLY place that persists app state. It writes to the
+    // artifact key-value store (the real persistence layer here — localStorage
+    // does not survive reloads in this environment) and, if a user is signed
+    // in, also pushes to Firestore. Both paths read the SAME `sessions`
+    // object via setSessions(), so there is no more split-brain state.
+    let saveDebounceTimer = null;
+    function saveData() {
+      setSessions(sessions); // keep window.sessions in sync for the cloud module
+      saveSessions(sessions);
+      saveSettings(currentSettingsSnapshot());
+
+      // Debounce cloud writes so rapid solve entries don't spam Firestore.
+      clearTimeout(saveDebounceTimer);
+      saveDebounceTimer = setTimeout(() => {
+        if (window.saveToCloud) {
+          window.saveToCloud();
+        }
+      }, 400);
+    }
+
+    function autoBlurActiveElement() {
+      if (document.activeElement && document.activeElement !== document.body) {
+        document.activeElement.blur();
+      }
+    }
+
+    function tick() {
+      if (!running) return;
+      timerEl.textContent = formatTime(performance.now() - startTime);
+      animationFrame = requestAnimationFrame(tick);
+    }
+
+    function startTimer() {
+      stopInspection();
+      running = true;
+      startTime = performance.now();
+      currentLaps = [];
+      lapsDisplay.textContent = "";
+      timerEl.style.color = "var(--color-text)";
+
+      toggleTimingUiHide(true);
+      toggleTimerZoom(true);
+      animationFrame = requestAnimationFrame(tick);
+    }
+
+    function recordLap() {
+      if (!running) return;
+      const elapsed = performance.now() - startTime;
+      currentLaps.push(elapsed);
+      lapsDisplay.textContent = currentLaps.map((l, i) => `L${i + 1}: ${(l / 1000).toFixed(2)}`).join("  ·  ");
+    }
+
+    async function stopTimer() {
+      const elapsed = performance.now() - startTime;
+      running = false;
+      cancelAnimationFrame(animationFrame);
+
+      toggleTimingUiHide(false);
+      toggleTimerZoom(false);
+
+      timerEl.style.color = "var(--color-text)";
+      timerEl.textContent = formatTime(elapsed, inspectionPenalty);
+
+      addSolve(elapsed, inspectionPenalty);
+      inspectionPenalty = "none";
+      lapsDisplay.textContent = "";
+
+      if (window.updateScramble) {
+        await window.updateScramble();
+      }
+    }
+
+    // ==========================================
+    // Firebase & Cloud Sync Module
+    // ==========================================
+    const firebaseConfig = {
+      apiKey: "AIzaSyCzqfYCrrt7dzcPEs4sBnFQL8QuTgTnKzM",
+      authDomain: "cubing-timer-7303a.firebaseapp.com",
+      projectId: "cubing-timer-7303a",
+      storageBucket: "cubing-timer-7303a.firebasestorage.app",
+      messagingSenderId: "682111536623",
+      appId: "1:682111536623:web:cd79bb7bc9fcc75f0bba1a",
+      measurementId: "G-P9LQQ0BM8S"
+    };
+
+    if (!firebase.apps.length) {
+      firebase.initializeApp(firebaseConfig);
+    }
+   const auth = firebase.auth();
+const db = firebase.firestore();
+const googleProvider = new firebase.auth.GoogleAuthProvider();
+
+let currentUser = null;
+let cloudLoadInProgress = false;
+
+function setSyncStatus(text) {
+  if (syncStatusEl) syncStatusEl.textContent = text;
+}
+
+auth.onAuthStateChanged(async (user) => {
+  const loginBtn = document.getElementById("btn-login");
+  const profileDiv = document.getElementById("user-profile");
+  const avatarEl = document.getElementById("user-avatar");
+  const nameEl = document.getElementById("user-name");
+
+  if (user) {
+    showLoading("Syncing solves from cloud...");
+    currentUser = user;
+
+    // --- UPDATE UI FOR SIGNED-IN STATE ---
+    if (loginBtn) loginBtn.style.display = "none";
+    if (profileDiv) profileDiv.style.display = "flex";
+    if (avatarEl) {
+      avatarEl.src = user.photoURL || "";
+      avatarEl.onerror = () => { avatarEl.style.display = "none"; };
+    }
+    if (nameEl) nameEl.textContent = user.displayName || "User";
+
+    try {
+      const docRef = db.collection("users").doc(user.uid);
+      const doc = await docRef.get();
+
+      if (doc.exists && doc.data().sessions) {
+        sessions = doc.data().sessions;
+        localStorage.setItem("cube_sessions_v2", JSON.stringify(sessions));
+      }
+
+      // Restore active session after cloud fetch
+      const savedSettings = await loadSettings();
+      if (savedSettings && savedSettings.currentSessionId && sessions[savedSettings.currentSessionId]) {
+        currentSessionId = savedSettings.currentSessionId;
+      } else if (!sessions[currentSessionId]) {
+        currentSessionId = Object.keys(sessions)[0] || "default";
+      }
+
+      renderSessionsDropdown();
+      
+      const targetEvent = sessions[currentSessionId]?.event || "333";
+      if (eventSelect) eventSelect.value = targetEvent;
+      if (window.setEvent) await window.setEvent(targetEvent);
+
+      if (typeof renderSolves === "function") renderSolves();
+      if (typeof updateStats === "function") updateStats();
+
+    } catch (e) {
+      console.error("Firebase sync error:", e);
+    } finally {
+      // Hide loading screen AFTER cloud data is fully fetched and rendered
+      hideLoading();
+    }
+  } else {
+    // --- UPDATE UI FOR SIGNED-OUT STATE ---
+    currentUser = null;
+    if (loginBtn) loginBtn.style.display = "inline-block";
+    if (profileDiv) profileDiv.style.display = "none";
+    hideLoading();
+  }
+});
+
+window.loginWithGoogle = function() {
+  auth.signInWithPopup(googleProvider).catch((error) => {
+    console.error("Google Sign-In Error:", error);
+    alert("Login failed: " + error.message);
+  });
+};
+
+window.logout = function() {
+  auth.signOut();
+};
+
+window.saveToCloud = async function() {
+  if (!currentUser) return;
+  if (cloudLoadInProgress) return; // don't overwrite during an active fetch
+
+  try {
+    setSyncStatus("Saving...");
+    
+    // Replace the entire sessions map in Firestore so deleted keys are removed
+    await db.collection("users").doc(currentUser.uid).set({
+      sessions: sessions,
+      lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+    });
+
+    setSyncStatus("Synced");
+  } catch (e) {
+    console.error("Failed to save solves to cloud:", e);
+    setSyncStatus("Sync error");
+  }
+};
+
+    // Keyboard Controls
+    document.addEventListener("keydown", e => {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.target.tagName === "TEXTAREA") return;
+      if (!modalBackdrop.classList.contains("hidden")) return;
+
+      if (e.code === "Escape") {
+        e.preventDefault();
+        cancelTimerHoldingState();
+        return;
+      }
+
+      if ((e.code === "KeyL") && running && lapsEnabled) {
+        e.preventDefault();
+        recordLap();
+        return;
+      }
+
+      if (e.code !== "Space" || e.repeat) return;
+
+      autoBlurActiveElement();
+      e.preventDefault();
+
+      if (running) {
+        stopTimer();
+        return;
+      }
+
+      if (holding) return;
+
+      holding = true;
+      ready = false;
+      timerEl.style.color = "#ef4444";
+
+      if (inspecting || !inspectionEnabled) {
+        toggleTimerZoom(true);
+      }
+
+      holdTimeout = setTimeout(() => {
+        if (holding) {
+          ready = true;
+          timerEl.style.color = "#22c55e";
+        }
+      }, 350);
+    });
+
+    document.addEventListener("keyup", e => {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.target.tagName === "TEXTAREA") return;
+      if (!modalBackdrop.classList.contains("hidden")) return;
+      if (e.code !== "Space") return;
+      e.preventDefault();
+
+      if (running) return;
+
+      clearTimeout(holdTimeout);
+
+      if (ready) {
+        holding = false;
+        ready = false;
+
+        if (inspectionEnabled && !inspecting) {
+          startInspection();
+        } else {
+          startTimer();
+        }
+      } else {
+        holding = false;
+        ready = false;
+        timerEl.style.color = inspecting ? "#f97316" : "var(--color-text)";
+        if (inspecting) {
+          toggleTimerZoom(false);
+        }
+      }
+    });
+
+    // Mobile Touch Controls
+    timerEl.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      autoBlurActiveElement();
+
+      if (running) {
+        stopTimer();
+        return;
+      }
+
+      if (holding) return;
+
+      holding = true;
+      ready = false;
+      timerEl.style.color = "#ef4444";
+
+      if (inspecting || !inspectionEnabled) {
+        toggleTimerZoom(true);
+      }
+
+      holdTimeout = setTimeout(() => {
+        if (holding) {
+          ready = true;
+          timerEl.style.color = "#22c55e";
+        }
+      }, 350);
+    }, { passive: false });
+
+    timerEl.addEventListener("touchend", (e) => {
+      e.preventDefault();
+
+      if (running) return;
+
+      clearTimeout(holdTimeout);
+
+      if (ready) {
+        holding = false;
+        ready = false;
+
+        if (inspectionEnabled && !inspecting) {
+          startInspection();
+        } else {
+          startTimer();
+        }
+      } else {
+        holding = false;
+        ready = false;
+        timerEl.style.color = inspecting ? "#f97316" : "var(--color-text)";
+        if (inspecting) {
+          toggleTimerZoom(false);
+        }
+      }
+    }, { passive: false });
+
+    lapsDisplay.addEventListener("touchstart", (e) => {
+      if (running && lapsEnabled) {
+        e.stopPropagation();
+        recordLap();
+      }
+    }, { passive: true });
+
+    // Initialization
+    window.addEventListener("DOMContentLoaded", async () => {
+      const savedSettings = await loadSettings();
+      const savedSessions = await loadSessions();
+
+      if (savedSessions && Object.keys(savedSessions).length > 0) {
+        setSessions(savedSessions);
+      } else {
+        setSessions(sessions);
+      }
+
+      if (savedSettings) {
+        currentTheme = savedSettings.theme || "oled";
+        hideUiWhileTiming = !!savedSettings.hideUi;
+        inspectionEnabled = !!savedSettings.inspection;
+        lapsEnabled = !!savedSettings.laps;
+        currentSessionId = sessions[savedSettings.currentSessionId] ? savedSettings.currentSessionId : Object.keys(sessions)[0];
+        compareSessionId = sessions[savedSettings.compareSessionId] ? savedSettings.compareSessionId : "";
+      } else {
+        currentSessionId = Object.keys(sessions)[0] || "default";
+      }
+
+      hideUiToggle.checked = hideUiWhileTiming;
+      inspectionToggle.checked = inspectionEnabled;
+      lapsToggle.checked = lapsEnabled;
+
+      applyTheme(currentTheme);
+      renderSessionsDropdown();
+      await switchSession(currentSessionId);
+    });
+    function showLoading(message = "Loading...") {
+  const overlay = document.getElementById("loading-overlay");
+  const textEl = document.getElementById("loading-text");
+  if (textEl) textEl.textContent = message;
+  if (overlay) {
+    overlay.style.display = "flex";
+    overlay.classList.remove("opacity-0", "pointer-events-none");
+  }
+}
+
+function hideLoading() {
+  const overlay = document.getElementById("loading-overlay");
+  if (!overlay) return;
+  overlay.classList.add("opacity-0", "pointer-events-none");
+  setTimeout(() => {
+    overlay.style.display = "none";
+  }, 300); // Matches the 300ms CSS transition
+}
+  </script>
+</body>
+</html>
